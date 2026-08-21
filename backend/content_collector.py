@@ -3,13 +3,13 @@ GEO System - Content Collection Module (Sprint 2)
 ---------------------------------------------------
 Given a URL (and an optional target keyword), this module:
   1. Fetches and parses the webpage (Content Collection Module)
-  2. Extracts raw text, metadata, and structural info
-  3. Determines the target query for semantic relevance:
+  2. Filters out non-content noise, INCLUDING ad/promotional blocks
+  3. Extracts raw text, metadata, and structural info
+  4. Determines the target query for semantic relevance:
        - uses the user-provided keyword if given
        - otherwise falls back to the page's own title/H1
-  4. Computes a first set of GEO features (readability, structure,
-     keyword density) -- early piece of the GEO Feature Extraction
-     Module (Sprint 3)
+  5. Computes a first set of GEO features (readability, structure,
+     ad density, keyword density)
 
 Usage:
     python content_collector.py <url>
@@ -41,12 +41,49 @@ def fetch_html(url: str, timeout: int = 10) -> str:
     return resp.text
 
 
+# Patterns commonly used in ad/promotional CSS classes and IDs.
+# Server-rendered ad blocks (not JS-injected ones, which we never see
+# anyway since we don't execute JavaScript) typically use one of these.
+AD_PATTERNS = [
+    "ad-", "ads-", "advert", "sponsor", "promo", "banner-ad",
+    "google-ad", "adsbygoogle", "advertisement", "dfp-ad",
+]
+
+
+def remove_ad_blocks(soup: BeautifulSoup) -> int:
+    """
+    Removes tags whose class/id matches known ad-related patterns.
+    Returns the count of blocks removed (used for ad-density scoring).
+    """
+    removed_count = 0
+    candidates = soup.find_all(attrs={"class": True}) + soup.find_all(attrs={"id": True})
+
+    seen = set()
+    for tag in candidates:
+        if id(tag) in seen or not tag.parent:
+            continue
+        class_str = " ".join(tag.get("class", [])).lower()
+        id_str = (tag.get("id") or "").lower()
+        combined = f"{class_str} {id_str}"
+
+        if any(pattern in combined for pattern in AD_PATTERNS):
+            seen.add(id(tag))
+            tag.decompose()
+            removed_count += 1
+
+    return removed_count
+
+
 def parse_content(html: str, url: str) -> dict:
     """Extract text, metadata, and structural elements from HTML."""
     soup = BeautifulSoup(html, "html.parser")
 
+    # Remove script/style/nav/footer noise before extracting text
     for tag in soup(["script", "style", "nav", "footer", "form", "noscript"]):
         tag.decompose()
+
+    # Remove ad/promotional blocks (server-rendered ones) and record how many
+    ads_removed = remove_ad_blocks(soup)
 
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
@@ -72,7 +109,16 @@ def parse_content(html: str, url: str) -> dict:
     links = soup.find_all("a", href=True)
     json_ld_blocks = soup.find_all("script", attrs={"type": "application/ld+json"})
 
+    # Alt text extraction (closes the "what about images" gap --
+    # we don't analyze image pixels, but we do capture their alt text,
+    # which is itself real machine-readable content)
+    images = soup.find_all("img")
+    images_with_alt = [img for img in images if img.get("alt", "").strip()]
+
     full_text = " ".join(paragraphs)
+
+    total_blocks_seen = len(paragraphs) + len(list_items) + ads_removed
+    ad_density = round((ads_removed / total_blocks_seen) * 100, 2) if total_blocks_seen else 0.0
 
     return {
         "url": url,
@@ -86,6 +132,10 @@ def parse_content(html: str, url: str) -> dict:
         "num_tables": len(tables),
         "num_links": len(links),
         "has_structured_data": len(json_ld_blocks) > 0,
+        "num_images": len(images),
+        "num_images_with_alt": len(images_with_alt),
+        "ad_blocks_removed": ads_removed,
+        "ad_density_percent": ad_density,
         "full_text": full_text,
         "word_count": len(full_text.split()),
     }
@@ -155,32 +205,25 @@ def keyword_density(text: str, top_n: int = 10) -> list:
 def structure_score(parsed: dict) -> float:
     score = 0
     if parsed["headings"]["h1"]:
-        score += 25
+        score += 20
     if parsed["headings"]["h2"]:
-        score += 20
+        score += 15
     if parsed["num_list_items"] > 0:
-        score += 20
+        score += 15
     if parsed["has_structured_data"]:
-        score += 20
+        score += 15
     if parsed["num_paragraphs"] >= 3:
         score += 15
-    return score
-
-
-def keyword_match_score(text: str, target_query: str) -> float:
-    """
-    Simple 0-100 score: what fraction of the target query's meaningful
-    words actually appear in the page text. This is a placeholder for
-    the fuller SBERT semantic relevance score (Sprint 3).
-    """
-    if not target_query:
-        return 0.0
-    query_words = set(re.findall(r"[A-Za-z']{3,}", target_query.lower()))
-    text_words = set(re.findall(r"[A-Za-z']{3,}", text.lower()))
-    if not query_words:
-        return 0.0
-    overlap = query_words & text_words
-    return round(100 * len(overlap) / len(query_words), 2)
+    # Ad density penalty: cleaner pages (less promotional noise) score higher
+    if parsed["ad_density_percent"] < 5:
+        score += 10
+    elif parsed["ad_density_percent"] < 15:
+        score += 5
+    # Alt-text coverage bonus
+    if parsed["num_images"] > 0:
+        alt_ratio = parsed["num_images_with_alt"] / parsed["num_images"]
+        score += round(alt_ratio * 10)
+    return min(score, 100)
 
 
 def extract_geo_features(parsed: dict, target_query_info: dict) -> dict:
@@ -190,10 +233,15 @@ def extract_geo_features(parsed: dict, target_query_info: dict) -> dict:
         "structure_score": structure_score(parsed),
         "has_author_byline": bool(parsed["author"]),
         "has_meta_description": bool(parsed["meta_description"]),
+        "ad_density_percent": parsed["ad_density_percent"],
+        "ad_blocks_removed": parsed["ad_blocks_removed"],
+        "image_alt_coverage_percent": (
+            round(100 * parsed["num_images_with_alt"] / parsed["num_images"], 2)
+            if parsed["num_images"] else None
+        ),
         "top_keywords": keyword_density(text),
         "target_query": target_query_info["target_query"],
         "target_query_source": target_query_info["source"],
-        "keyword_match_score": keyword_match_score(text, target_query_info["target_query"]),
         "word_count": parsed["word_count"],
     }
 
